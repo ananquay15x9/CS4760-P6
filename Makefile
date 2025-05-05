@@ -17,18 +17,18 @@ WORKER_OBJS = worker.o
 all: $(OSS_TARGET) $(WORKER_TARGET)
 
 $(OSS_TARGET): $(OSS_OBJS)
-    $(CC) $(CFLAGS) -o $(OSS_TARGET) $(OSS_OBJS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $(OSS_TARGET) $(OSS_OBJS) $(LDFLAGS)
 
 $(WORKER_TARGET): $(WORKER_OBJS)
-    $(CC) $(CFLAGS) -o $(WORKER_TARGET) $(WORKER_OBJS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $(WORKER_TARGET) $(WORKER_OBJS) $(LDFLAGS)
 
 oss.o: oss.c
-    $(CC) $(CFLAGS) -c oss.c
+	$(CC) $(CFLAGS) -c oss.c
 
 worker.o: worker.c
-    $(CC) $(CFLAGS) -c worker.c
+	$(CC) $(CFLAGS) -c worker.c
 
 clean:
-    rm -f $(OSS_TARGET) $(WORKER_TARGET) *.o *.log core.*
+	rm -f $(OSS_TARGET) $(WORKER_TARGET) *.o *.log core.*
 
 .PHONY: clean all
