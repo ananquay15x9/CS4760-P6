@@ -3,7 +3,7 @@
 #Date: 5/5/2025
 
 CC = gcc
-CFALGS = -Wall -g
+CFLAGS = -Wall -g
 LDFLAGS = -lrt
 
 #Target executables
