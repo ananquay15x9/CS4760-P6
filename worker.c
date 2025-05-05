@@ -13,15 +13,6 @@
 #include <string.h> 
 #include "ipc_config.h"
 
-//Define a key for shared memory 
-#define SHM_KEY_PATH "oss.c"
-#define SHM_KEY_ID 1
-
-//Struct for the simulated clock
-typedef struct {
-	unsigned int seconds;
-	unsigned int nanoseconds;
-} SimulatedClock;
 
 int main (int argc, char *argv[]) {
 	pid_t myPid = getpid();
@@ -34,19 +25,19 @@ int main (int argc, char *argv[]) {
 	int shmid = -1;
 	SimulatedClock *simClock = NULL;
 
-	if (key == -1) {
+	if (shm_key == -1) {
 		fprintf(stderr, "WORKER PID:%d: Error generating key with ftok: %s\n", myPid, strerror(errno));
 		exit(EXIT_FAILURE);
     	}
 
 	//2. Get the existing shared memory segment ID
-	shmid = shmget(key, sizeof(SimulatedClock), 0666);
+	shmid = shmget(shm_key, sizeof(SimulatedClock), 0666);
 	if (shmid == -1) {
 		fprintf(stderr, "WORKER PID:%d: Error shmget: %s\n", myPid, strerror(errno));
 		exit(EXIT_FAILURE);
     	}
 
-	//3. Attach the sahred memory segment
+	//3. Attach the shared memory segment
 	simClock = (SimulatedClock *)shmat(shmid, NULL, 0);
 	if (simClock == (SimulatedClock *)-1) {
 		fprintf(stderr, "WORKER PID:%d: Error attaching shared memory with shmat: %s\n", myPid, strerror(errno));
@@ -54,10 +45,11 @@ int main (int argc, char *argv[]) {
 	}
 
 	//Access Shared Clock
-    	printf("WORKER PID:%d PPID:%d: Attached to shared memory clock: %u:%09u\n", myPid, simClock->seconds, simClock->nanoseconds);
+    	printf("WORKER PID:%d PPID:%d: Attached to shared memory clock: %u:%09u\n", 
+		myPid, parentPid, simClock->seconds, simClock->nanoseconds);
 
 	//Message queue setup
-	key_t msg_key = ftok(SHM_KEY_PATH, MSG_KEY_ID);
+	key_t msg_key = ftok(MSG_KEY_PATH, MSG_KEY_ID);
 	int msqid = -1;
 
 	if (msg_key == -1) {
@@ -81,7 +73,7 @@ int main (int argc, char *argv[]) {
 	printf("WORKER PID:%d: Waiting for message from OSS (type %d)...\n", myPid, myPid);
 
 	//Loop to handle potential EINTR interruptions or queue removal (EIDRM)
-	while (msgrcv(msqid, &oss_message, sizeof(OssMsg) - sizeof(long), myPid, 0) == -1 {
+	while (msgrcv(msqid, &oss_message, sizeof(OssMsg) - sizeof(long), myPid, 0) == -1) {
 		if (errno == EINTR) {
 			fprintf(stderr, "WORKER PID:%d: msgrcv interrupted, retrying...\n", myPid);
 			continue;
@@ -97,7 +89,7 @@ int main (int argc, char *argv[]) {
 	}
 	printf("WORKER PID:%d: Received message from OSS. Payload: %d\n", myPid, oss_message.payload);
 
-	//Send Message memory request o OSS
+	//Send Message memory request to OSS
 	WorkerMsg worker_message;
 	worker_message.mtype = parentPid; //Address message to OSS PID
 	worker_message.memory_address = 1024; //Placeholder address

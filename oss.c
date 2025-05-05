@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/wait.h>
 #include <sys/shm.h>
 #include <signal.h>
 #include <errno.h>
@@ -14,22 +16,11 @@
 #include <time.h>
 #include "ipc_config.h"
 
-//Define a key for shared memory
-#define SHM_KEY_PATH "oss.c" 
-#define SHM_KEY_ID 1
-
-//Struct for the simulated clock 
-typedef struct {
-    unsigned int seconds;
-    unsigned int nanoseconds;
-} SimulatedClock;
-
 //Global variables for IPC
 static int shmid = -1; //Shared memory ID
 static int msqid = -1; //Message queue ID
 static SimulatedClock *simClock = NULL; //Pointer to shared clock
 static pid_t childPid = -1;
-
 
 //Function protoypes
 static void cleanup(int exit_status);
@@ -79,22 +70,6 @@ int main(int argc, char *argv[]) {
     }
     printf("OSS: Message queue created (ID: %d)\n", msqid);
 
-//=================
-    //3. Attach the shared memory segment to the process's address space
-    simClock = (SimulatedClock *)shmat(shmid, NULL, 0);
-    if(simClock == (SimulatedClock *)-1) {
-	fprintf(stderr, "OSS: Error attaching shared memory with shmat: %s\n", strerror(errno));
-	//
-	shmctl(shmid, IPC_RMID, NULL); //Attempt removal
-	exit(EXIT_FAILURE);
-    }
-
-    //4. Initialize the shared clock
-    simClock->seconds = 0;
-    simClock->nanoseconds = 0;
-    printf("OSS: Shared memory clock initialized at %u:%09u\n", simClock->seconds, simClock->nanoseconds);
-
-//===========================
 
     //Fork and execute worker here
     printf("OSS: Forking worker process...\n");
