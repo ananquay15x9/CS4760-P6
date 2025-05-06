@@ -44,6 +44,12 @@ typedef struct {
 
 typedef int PageTableEntry;
 
+//Step 6 PCB Update
+typedef enum {
+    PROC_READY,
+    PROC_BLOCKED_IO,
+} ProcessState;
+
 //Step 4 PCB Structure Start
 typedef struct {
     pid_t pid; 
@@ -52,6 +58,15 @@ typedef struct {
     unsigned int start_nanos; //Time when created (from simClock)
     //Step 5 PCB update
     PageTableEntry page_table[PROCESS_PAGE_TABLE_SIZE]; //Per-process page table
+    //Field for step 6
+    ProcessState state;
+    unsigned int io_completion_seconds; 
+    unsigned int io_completion_nanos;
+    int blocked_on_address;
+    int blocked_request_type;
+    int blocked_page_number;
+    int blocked_target_frame;
+
 } ProcessControlBlock;
 
 
@@ -163,6 +178,14 @@ static int findFreeFrame() {
     return -1; //No free frame found
 }
 
+//Step 6 function for time adv
+static void advance_time_by_nanos(unsigned int *current_s, unsigned int *current_ns, long long increment_ns) {
+    *current_ns += increment_ns;
+    while (*current_ns >= 1000000000) {
+	(*current_s)++;
+	*current_ns -= 1000000000;
+    }
+}
 
 //Step 4 Find free PCB Slot
 static int findFreePcbSlot() {
@@ -375,11 +398,92 @@ int main(int argc, char *argv[]) {
 		log_message("Error: Could not find PCB entry for terminated child P%d", terminatedPid);
 	    }
 	}
+
+
 	//ignore ECHILD
 	if (terminatedPid == -1 && errno != ECHILD) {
 	    log_message("Error: waitpid failed: %s", strerror(errno));
 	    terminate_flag = 1; //end simul on unexpected error
 	}
+
+	//Step 6 check blocked process
+	for (int i = 0; i < HARD_PROC_LIMIT; i++) {
+	    if (pcbTable[i].occupied && pcbTable[i].state == PROC_BLOCKED_IO) {
+		//need to check if simClock time is longer than i/o completion time
+		if (simClock->seconds > pcbTable[i].io_completion_seconds ||
+		    (simClock->seconds == pcbTable[i].io_completion_seconds && 
+		     simClock->nanoseconds >= pcbTable[i].io_completion_nanos)) {
+
+		    log_message("I/O complete for P%d (PID %d). Page %d now in frame %d.", 
+				i, pcbTable[i].pid, pcbTable[i].blocked_page_number, pcbTable[i].blocked_target_frame);
+
+		    pcbTable[i].state = PROC_READY; // Unblock process
+
+		    //Send grant message
+		    OssMsg grant_message;
+		    grant_message.mtype = pcbTable[i].pid;
+		    grant_message.payload = 1; //just grant
+
+		    log_message("Sending grant confirmation to P%d for address %d.",
+                                pcbTable[i].pid, pcbTable[i].blocked_on_address);
+                    while (msgsnd(msqid, &grant_message, sizeof(OssMsg) - sizeof(long), 0) == -1) {
+                        if (errno == EINTR) continue;
+			log_message("Error msgsnd grant (I/O complete) to P%d: %s", pcbTable[i].pid, strerror(errno));
+			break;
+		    }
+		    if (errno != EINTR) { 
+			log_message("Grant sent to P%d for address %d after I/O completion.", 
+				    pcbTable[i].pid, pcbTable[i].blocked_on_address);
+		    }
+		}
+	    }
+	}
+
+	//Step 6 deadlock avoidance for I/O
+	if (active_children_count > 0) {
+	    bool all_blocked = true;
+	    int unblocked_count = 0;
+	    for (int i = 0; i < HARD_PROC_LIMIT; i++) {
+		if (pcbTable[i].occupied && pcbTable[i].state != PROC_BLOCKED_IO) {
+		    all_blocked = false;
+		    break;
+		}
+		if(pcbTable[i].occupied && pcbTable[i].state == PROC_BLOCKED_IO) {
+		    //Count blocked processes waiting for I/O
+		}
+	    }
+
+	    if (all_blocked && active_children_count > 0) {
+		unsigned int earliest_s = 0xFFFFFFFF; // Max unsigned int
+                unsigned int earliest_ns = 0xFFFFFFFF;
+                bool found_blocked = false;
+
+		for (int i = 0; i < HARD_PROC_LIMIT; i++) {
+		    if (pcbTable[i].occupied && pcbTable[i].state == PROC_BLOCKED_IO) {
+                        found_blocked = true;
+                        if (pcbTable[i].io_completion_seconds < earliest_s) {
+                            earliest_s = pcbTable[i].io_completion_seconds;
+                            earliest_ns = pcbTable[i].io_completion_nanos;
+                        } else if (pcbTable[i].io_completion_seconds == earliest_s &&
+                                   pcbTable[i].io_completion_nanos < earliest_ns) {
+                            earliest_ns = pcbTable[i].io_completion_nanos;
+                        }
+                    }
+                }
+
+		if (found_blocked && (earliest_s > simClock->seconds ||
+		    (earliest_s == simClock->seconds && earliest_ns > simClock->nanoseconds))) {
+		    log_message("All %d active processes are blocked for I/O. Advancing clock from %u:%09u to %u:%09u.",
+                                active_children_count, simClock->seconds, simClock->nanoseconds, earliest_s, earliest_ns);
+                    simClock->seconds = earliest_s;
+                    simClock->nanoseconds = earliest_ns;
+		}
+	    }
+	}
+
+
+
+
 
 	//Launch new children
 	if (total_children_launched < max_total_children &&
@@ -523,6 +627,10 @@ int main(int argc, char *argv[]) {
 
 		    advanceClock(0, 14000000); //add 14ms page fault
 
+
+		    //Step 6 Block process for I/O
+		    log_message("P%d (page %d) requires I/O. Blocking process.", requesting_pid, requested_page);
+
 		    //Update frame table entry
 		    frameTable[target_frame].occupied = true;
 		    frameTable[target_frame].process_id = requesting_pid;
@@ -532,6 +640,25 @@ int main(int argc, char *argv[]) {
 
 		    //Update requesting proess's page table
 		    pcbTable[pcbIndex].page_table[requested_page] = target_frame;
+
+		    //switch the process to blocked state and record I/O
+		    pcbTable[pcbIndex].state = PROC_BLOCKED_IO;
+		    pcbTable[pcbIndex].io_completion_seconds = simClock->seconds;
+		    pcbTable[pcbIndex].io_completion_nanos = simClock->nanoseconds;
+		    //Add 14ms to i/o
+		    advance_time_by_nanos(&pcbTable[pcbIndex].io_completion_seconds, &pcbTable[pcbIndex].io_completion_nanos, 14000000);
+
+		    //Store details of the request here
+		    pcbTalbe[pcbIndex].blocked_on_address = requested_address;
+		    pcbTable[pcbIndex].blocked_request_type = request_type;
+		    pcbTable[pcbIndex].blocked_page_number = requested_page;
+		    pcbTable[pcbIndex].blocked_target_frame = target_frame;
+
+		    log_message("P%d (page %d) blocked for I/O to frame %d. Will complete at %u:%09u.",
+                		requesting_pid, requested_page, target_frame,
+                		pcbTable[pcbIndex].io_completion_seconds, pcbTable[pcbIndex].io_completion_nanos);
+
+		    //============Step6
 
 		    log_message("Page %d for P%d loaded into frame %d", requested_page, requesting_pid, target_frame);
 		} else {
