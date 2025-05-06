@@ -132,7 +132,7 @@ int main(int argc, char *argv[]) {
     int opt;
     int interval_ms = DEFAULT_LAUNCH_INTERVAL_MS;
     //
-    while ((opt = getopt(argc, argv, "hf:")) != -1) {
+    while ((opt = getopt(argc, argv, "hn:s:i:f:")) != -1) {
 	switch (opt) {
 	    case 'n': //Max total processes to launch
 		max_total_children = atoi(optarg);
@@ -204,10 +204,6 @@ int main(int argc, char *argv[]) {
     //Set 5 seconds 
     alarm(5);
     sigaction(SIGALRM, &sa, NULL); //Handle SIGALRM
-
-
-    //Initialize PCB Table
-    initializePcbTable(); //Call the new init function
     
 
     //Shared memory setup
@@ -231,6 +227,9 @@ int main(int argc, char *argv[]) {
    
     simClock->seconds = 0;
     simClock->nanoseconds = 0;
+
+    //Initialize PCB table
+    initializePcbTable(); 
 
     //Log startup messages
     log_message("Starting... (PID: %d)", myPid); //Correctly moved here
