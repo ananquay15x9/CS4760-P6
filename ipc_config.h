@@ -11,7 +11,9 @@
 #define SHM_KEY_PATH "oss.c"
 #define SHM_KEY_ID 1
 #define MSG_KEY_ID 2
-
+#define MEMORY_SIZE 32768 //32KB total memory address
+#define PAGE_SIZE 1024 //1kb page size
+#define NUM_PAGES (MEMORY_SIZE / PAGE_SIZE) //Should be 32
 
 //Structure for the simulated clock
 typedef struct {

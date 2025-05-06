@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <stdbool.h>
 
 #include "ipc_config.h"
 
@@ -26,6 +27,22 @@
 #define DEFAULT_TOTAL_PROCS 5 //Default for -n
 #define DEFAULT_MAX_CONCURRENT 5 //Default for -s
 #define DEFAULT_LAUNCH_INTERVAL_MS 500 //Default for -i (ms)
+//Step 5 define
+#define FRAME_TABLE_SIZE 256
+#define PROCESS_PAGE_TABLE_SIZE 32
+#define PAGE_NOT_IN_MEMORY -1 
+
+//Step 5 Frame Table Structure
+typedef struct {
+    bool occupied; 
+    int dirty_bit;
+    pid_t process_id; 
+    int page_number;
+    unsigned int last_ref_seconds; //clock time of last ref
+    unsigned int last_ref_nanos; //clock time of last ref
+} FrameEntry;
+
+typedef int PageTableEntry;
 
 //Step 4 PCB Structure Start
 typedef struct {
@@ -33,7 +50,10 @@ typedef struct {
     int occupied; // 0 = free, 1 = occupied
     unsigned int start_seconds; //Time when created (from simClock)
     unsigned int start_nanos; //Time when created (from simClock)
+    //Step 5 PCB update
+    PageTableEntry page_table[PROCESS_PAGE_TABLE_SIZE]; //Per-process page table
 } ProcessControlBlock;
+
 
 //Global variables for IPC
 static int shmid = -1; //Shared memory ID
@@ -56,6 +76,9 @@ static unsigned int next_launch_time_s = 0; // Clock time for next launch
 static unsigned int next_launch_time_ns = 0; // Clock time for next launch
 static volatile sig_atomic_t terminate_flag = 0; 
 
+//Step 5 Globals 
+static FrameEntry frameTable[FRAME_TABLE_SIZE];
+
 //Function protoypes
 static void cleanup(int exit_status);
 static void signal_handler(int signum);
@@ -63,7 +86,8 @@ static void advanceClock(unsigned int seconds, unsigned int nanoseconds);
 static void log_message(const char* format, ...);
 static int findFreePcbSlot();
 static void initializePcbTable();
-
+static void initializeFrameTable(); //step 5 
+static int findFreeFrame(); //Helper to find an empty frame
 
 //Function for Clock Advance
 static void advanceClock(unsigned int seconds_inc, unsigned int nano_inc) {
@@ -105,13 +129,40 @@ static void log_message(const char* format, ...) {
 //Step 4 Function Initialize PCB Table
 static void initializePcbTable() {
     for (int i = 0; i < HARD_PROC_LIMIT; i++) {
-	pcbTable[i].occupied = 0;
+	pcbTable[i].occupied = false;
 	pcbTable[i].pid = 0;
 	pcbTable[i].start_seconds = 0;
 	pcbTable[i].start_nanos = 0;
+	//Step 5 PCB Table
+	for (int j = 0; j < PROCESS_PAGE_TABLE_SIZE; j++) {
+	    pcbTable[i].page_table[j] = PAGE_NOT_IN_MEMORY; //-1
+	}
     }
-    log_message("PCB table initialized.");
 }
+
+//Step 5 Function Initialize Frame Table
+static void initializeFrameTable() {
+    for (int i = 0; i < FRAME_TABLE_SIZE; i++) {
+	frameTable[i].occupied = false;
+	frameTable[i].dirty_bit = 0;
+	frameTable[i].process_id = 0;
+	frameTable[i].page_number = -1;
+	frameTable[i].last_ref_seconds = 0;
+	frameTable[i].last_ref_nanos = 0;
+    }
+    log_message("Frame table initialized (%d frames).", FRAME_TABLE_SIZE);
+}
+
+//Step 5 function to find free frame
+static int findFreeFrame() {
+    for (int i = 0; i < FRAME_TABLE_SIZE; i++) {
+	if (!frameTable[i].occupied) {
+	    return i;
+	} 
+    }
+    return -1; //No free frame found
+}
+
 
 //Step 4 Find free PCB Slot
 static int findFreePcbSlot() {
@@ -230,6 +281,7 @@ int main(int argc, char *argv[]) {
 
     //Initialize PCB table
     initializePcbTable(); 
+    initializeFrameTable(); //Initialize the frame table
 
     //Log startup messages
     log_message("Starting... (PID: %d)", myPid); //Correctly moved here
@@ -278,7 +330,7 @@ int main(int argc, char *argv[]) {
 	pid_t terminatedPid;
 	//Use while loop to reap all zombies that might exists
 	while ((terminatedPid = waitpid(-1, &status, WNOHANG)) > 0) {
-	    log_message("Child P%d terminated.", terminatedPid);
+	    log_message("Child P%d terminated.", (int)(terminatedPid), terminatedPid);
 	    int pcbIndex = -1;
 	    for (int i = 0; i < HARD_PROC_LIMIT; i++) {
 		if (pcbTable[i].occupied && pcbTable[i].pid == terminatedPid) {
@@ -286,12 +338,32 @@ int main(int argc, char *argv[]) {
 		    break;
 		}
 	    }
+
 	    if (pcbIndex != -1) {
+		//Step 5 Release Frames
+		log_message("Releasing memory frames for terminated P%d (PCB %d)", terminatedPid, pcbIndex);
+		int frames_released = 0;
+		for (int f = 0; f < FRAME_TABLE_SIZE; f++) {
+		    if (frameTable[f].occupied && frameTable[f].process_id == terminatedPid) {
+			frameTable[f].occupied = false;
+			frameTable[f].process_id = 0;
+			frameTable[f].page_number = -1;
+			frameTable[f].dirty_bit = 0; //Reset dirty bit here
+			//Reset LRU timestamp
+			frameTable[f].last_ref_seconds = 0;
+			frameTable[f].last_ref_nanos = 0;
+			frames_released++;
+		    }
+		}
+		log_message("P%d released %d frames.", terminatedPid, frames_released);
+
 		log_message("Clearing PCB entry %d for P%d", pcbIndex, terminatedPid);
-		pcbTable[pcbIndex].occupied = 0;
+		pcbTable[pcbIndex].occupied = false;
 		pcbTable[pcbIndex].pid = 0;
+		for (int j = 0; j < PROCESS_PAGE_TABLE_SIZE; j++) pcbTable[pcbIndex].page_table[j] = PAGE_NOT_IN_MEMORY;
 		active_children_count--;
 
+		//Log termination status
 		if (WIFEXITED(status)) { 
 		    log_message("P%d terminated normally (status: %d)", terminatedPid, WEXITSTATUS(status)); 
 		} else if (WIFSIGNALED(status)) { 
@@ -382,31 +454,147 @@ int main(int argc, char *argv[]) {
 
 	//Loop to handle potential EINTR interruptions during msgrcv
 	while (msgrcv(msqid, &worker_message, sizeof(WorkerMsg) - sizeof(long), myPid, IPC_NOWAIT) != -1) {
-	//Handler for Step 3
-	    pid_t workerPid = worker_message.sender_pid; //Get sender PID from message
-	    int address = worker_message.memory_address;
-	    int type = worker_message.request_type;
+	    
+	    //Step 5 Memory request handling
+	    pid_t requesting_pid = worker_message.sender_pid;
+	    int requested_address = worker_message.memory_address;
+	    int request_type = worker_message.request_type; // 0=read, 1=write
 
-	//1. Log request
-	    log_message("P%d requesting %s of address %d", workerPid, (type == 0) ? "read" : "write", address);
+	    log_message("P%d requesting %s of address %d", requesting_pid, (request_type == 0) ? "read" : "write", requested_address);
+	    advanceClock(0, 10); //basic time for memory check overhead
 
-	//2. Advance Clock
-	    advanceClock(0, 100);
 
-	//3. Log Grant
-	    log_message("Granting P%d %s request for address %d", workerPid, (type == 0) ? "read" : "write", address);
+	    if (requested_address < 0 || requested_address >= MEMORY_SIZE) {
+		log_message("Error: P%d requested invalid address %d. Ignoring.", requesting_pid, requested_address);
+		continue; // skip to next message
+	    }
 
-	//4. Send confirmation/grant back to worker
-	    OssMsg grant_message;
-	    grant_message.mtype = workerPid; //Send to specific worker
-	    grant_message.payload = 1;
-	    while (msgsnd(msqid, &grant_message, sizeof(OssMsg) - sizeof(long), 0) == -1) {
-	        if (errno == EINTR) continue; 
-		log_message("Error msgsnd grant to P%d: %s", workerPid, strerror(errno));
-		break;
-	    } 
-	    if (errno != EINTR) log_message("Grant confirmation sent to P%d.", workerPid); // Log if not interrupted
-	    advanceClock(0, 1000);
+	    int requested_page = requested_address / PAGE_SIZE; //Page number (0-31)
+	    int pcbIndex = -1;
+	    for (int i = 0; i < HARD_PROC_LIMIT; i++) {
+		if (pcbTable[i].occupied && pcbTable[i].pid == requesting_pid) {
+		    pcbIndex = i;
+		    break;
+		}
+	    }
+
+	    if (pcbIndex == -1) {
+		log_message("Error: Received request from unknown or terminated PID %d. Ignoring.", requesting_pid);
+		continue; //skip to next message
+	    }
+
+	    //Page table lookup
+	    PageTableEntry frame_num = pcbTable[pcbIndex].page_table[requested_page];
+
+	    if (frame_num != PAGE_NOT_IN_MEMORY) {
+		//Page hit
+		log_message("Address %d (page %d) found in frame %d", requested_address, requested_page, frame_num);
+		advanceClock(0, 100); //add time for memory access
+
+		//
+		if (request_type == 1) {
+		    //set dirty bit for step 7 later
+		    frameTable[frame_num].dirty_bit = 1;
+		    log_message("Frame %d marked dirty by write from P%d", frame_num, requesting_pid);
+		}
+
+
+
+		//4. Send confirmation/grant back to worker
+	    	OssMsg grant_message;
+	    	grant_message.mtype = requesting_pid; //Send to specific worker
+	    	grant_message.payload = 1;
+	    	while (msgsnd(msqid, &grant_message, sizeof(OssMsg) - sizeof(long), 0) == -1) {
+	            if (errno == EINTR) continue; 
+		    log_message("Error msgsnd grant (hit) to P%d: %s", requesting_pid, strerror(errno));
+		    break;
+	    	} 
+	    	if (errno != EINTR) log_message("Grant confirmation sent to P%d.", requesting_pid, requested_address); // Log if not interrupted
+	    } else {
+		//Page fault
+		log_message("Address %d (page %d) not in memory for P%d. Page Fault.", requested_address, requested_page, requesting_pid);
+		advanceClock(0, 100); //Time for page fault detection
+
+		int target_frame = findFreeFrame();
+
+		if (target_frame != -1) {
+		    //Free frame found
+		    log_message("Allocating free frame %d for P%d page %d", target_frame, requesting_pid, requested_page);
+
+		    advanceClock(0, 14000000); //add 14ms page fault
+
+		    //Update frame table entry
+		    frameTable[target_frame].occupied = true;
+		    frameTable[target_frame].process_id = requesting_pid;
+                    frameTable[target_frame].page_number = requested_page;
+		    frameTable[target_frame].dirty_bit = (request_type == 1) ? 1 : 0;
+		    //For step 8 later, update LRU timestamp
+
+		    //Update requesting proess's page table
+		    pcbTable[pcbIndex].page_table[requested_page] = target_frame;
+
+		    log_message("Page %d for P%d loaded into frame %d", requested_page, requesting_pid, target_frame);
+		} else {
+		    //No free frames step 5 simple eviction
+		    log_message("No free frames. Evicting frame 0 (simple policy).");
+		    advanceClock(0, 500);
+
+		    int evict_frame = 0; //Simplest policy: always evic frame 0
+		    pid_t evicted_pid = frameTable[evict_frame].process_id;
+		    int evicted_page = frameTable[evict_frame].page_number;
+
+		    log_message("Evicting P%d page %d from frame %d", evicted_pid, evicted_page, evict_frame);
+
+		    //Update evicted process's page table
+		    if (evicted_pid > 0 && evicted_page >= 0 && evicted_page < PROCESS_PAGE_TABLE_SIZE) {
+			int evicted_pcb_index = -1;
+			for (int i = 0; i < HARD_PROC_LIMIT; i++) {
+			    if(pcbTable[i].occupied && pcbTable[i].pid == evicted_pid) {
+				evicted_pcb_index = i;
+				break;
+			    }
+			}
+			if (evicted_pcb_index != -1) {
+			    pcbTable[evicted_pcb_index].page_table[evicted_page] = PAGE_NOT_IN_MEMORY;
+                           log_message("Updated P%d's page table (page %d set to -1)", evicted_pid, evicted_page);
+                        } else {
+                            log_message("Warning: Couldn't find PCB for evicted process P%d to update page table.", evicted_pid);
+                        }
+                    } else {
+                         log_message("Warning: Invalid evicted process (%d) or page (%d) in frame %d.", evicted_pid, evicted_page, evict_frame);
+                    }
+
+		    //Now allocate freed frame
+		    target_frame = evict_frame;
+		    log_message("Allocating evicted frame %d for P%d page %d", target_frame, requesting_pid, requested_page);
+
+		    advanceClock(0, 14000000);
+
+		    //Update frame table entry
+		    frameTable[target_frame].occupied = true;
+                    frameTable[target_frame].process_id = requesting_pid;
+                    frameTable[target_frame].page_number = requested_page;
+                    frameTable[target_frame].dirty_bit = (request_type == 1) ? 1 : 0;
+
+		    //Update requesting process's page table
+		    pcbTable[pcbIndex].page_table[requested_page] = target_frame;
+
+		    log_message("Page %d for P%d loaded into frame %d after eviction", requested_page, requesting_pid, target_frame);
+		}
+
+		//OSS grant message sending
+		OssMsg grant_message;
+                grant_message.mtype = requesting_pid;
+                grant_message.payload = 1; // Simple grant
+                while (msgsnd(msqid, &grant_message, sizeof(OssMsg) - sizeof(long), 0) == -1) {
+                     if (errno == EINTR) continue;
+                     log_message("Error msgsnd grant (fault) to P%d: %s", requesting_pid, strerror(errno));
+                     break; // Exit loop on error
+                }
+                 if (errno != EINTR) log_message("Granted P%d request for address %d after page fault", requesting_pid, requested_address);
+
+            } // End Page Fault Handling
+
 
 	}
 	//Check errno
