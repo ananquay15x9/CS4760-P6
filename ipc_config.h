@@ -8,10 +8,10 @@
 #include <sys/types.h>
 
 //Key definitions for IPC resources
-#define SHM_KEY_PATH "oss.c"  
+#define SHM_KEY_PATH "oss.c"
 #define SHM_KEY_ID 1
 #define MSG_KEY_ID 2
-#define MSG_KEY_PATH "worker.c"
+
 
 //Structure for the simulated clock
 typedef struct {
@@ -28,6 +28,7 @@ typedef struct {
 //Message structure for Worker -> OSS
 typedef struct {
 	long mtype;
+	pid_t sender_pid;
 	int memory_address;
 	int request_type;
 } WorkerMsg;
