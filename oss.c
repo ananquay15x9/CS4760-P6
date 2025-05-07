@@ -91,8 +91,13 @@ static unsigned int next_launch_time_s = 0; // Clock time for next launch
 static unsigned int next_launch_time_ns = 0; // Clock time for next launch
 static volatile sig_atomic_t terminate_flag = 0; 
 
+
 //Step 5 Globals 
 static FrameEntry frameTable[FRAME_TABLE_SIZE];
+
+//Statistics globals
+static unsigned long total_memory_accesses = 0;
+static unsigned long total_page_faults = 0;
 
 //Function protoypes
 static void cleanup(int exit_status);
@@ -103,6 +108,8 @@ static int findFreePcbSlot();
 static void initializePcbTable();
 static void initializeFrameTable(); //step 5 
 static int findFreeFrame(); //Helper to find an empty frame
+static void print_memory_layout();
+
 
 //Function for Clock Advance
 static void advanceClock(unsigned int seconds_inc, unsigned int nano_inc) {
@@ -208,6 +215,37 @@ static int findFreePcbSlot() {
     }
     return -1; //No free slot found
 }
+
+// Print frame table and page tables)
+static void print_memory_layout() {
+    log_message("\nCurrent memory layout at time %u:%09u is:", simClock->seconds, simClock->nanoseconds);
+    log_message("    Occupied    DirtyBit    LastRefs    LastRefNano");
+    for (int i = 0; i < FRAME_TABLE_SIZE; i++) {
+	if (frameTable[i].occupied) {
+	    log_message("Frame %d:    yes          %d          %u              %u", i, frameTable[i].dirty_bit, frameTable[i].last_ref_seconds, frameTable[i].last_ref_nanos);
+	} else {
+	    log_message("Frame %d:    no           0          0", i);
+	}
+    }
+    for (int p = 0; p < HARD_PROC_LIMIT; p++) {
+	if (pcbTable[p].occupied) {
+	    char page_table_str[256] = {0};
+	    //char buf[16];
+	    int len = 0;
+	    len += snprintf(page_table_str + len, sizeof(page_table_str) - len, "P%d page table: [", p);
+	    for (int j = 0; j < PROCESS_PAGE_TABLE_SIZE; j++) {
+                if (pcbTable[p].page_table[j] == PAGE_NOT_IN_MEMORY)
+                    len += snprintf(page_table_str + len, sizeof(page_table_str) - len, " -1");
+                else
+                    len += snprintf(page_table_str + len, sizeof(page_table_str) - len, " %d", pcbTable[p].page_table[j]);
+            }
+            snprintf(page_table_str + len, sizeof(page_table_str) - len, " ]");
+            log_message("%s", page_table_str);
+        }
+    }
+}
+
+//=========frame table
 
 
 //====MAIN=====
@@ -348,6 +386,9 @@ int main(int argc, char *argv[]) {
 	next_launch_time_s++;
 	next_launch_time_ns -= 1000000000;
     }
+
+
+    unsigned int last_layout_print_sec = 0;
 
     while (!terminate_flag) {
 	//Check termination conditions
@@ -494,9 +535,6 @@ int main(int argc, char *argv[]) {
 	}
 
 
-
-
-
 	//Launch new children
 	if (total_children_launched < max_total_children &&
 	    active_children_count < max_concurrent_children &&
@@ -602,6 +640,9 @@ int main(int argc, char *argv[]) {
 		continue; //skip to next message
 	    }
 
+	    //Increment total memory accesses
+	    total_memory_accesses++;
+
 	    //Page table lookup
 	    PageTableEntry frame_num = pcbTable[pcbIndex].page_table[requested_page];
 
@@ -613,7 +654,7 @@ int main(int argc, char *argv[]) {
 		//Step 8==update timestamp on Page Hit
 		frameTable[frame_num].last_ref_seconds = simClock->seconds;
 		frameTable[frame_num].last_ref_nanos = simClock->nanoseconds;
-		log_message("LRU/MRU: Frame %d timestamp updated to %u:%09u by P%d (Page Hit)",
+		log_message("LRU: Frame %d timestamp updated to %u:%09u by P%d (Page Hit)",
 			    frame_num, simClock->seconds, simClock->nanoseconds, requesting_pid);
 
 
@@ -638,6 +679,7 @@ int main(int argc, char *argv[]) {
 	    	if (errno != EINTR) log_message("Grant confirmation sent to P%d.", requesting_pid, requested_address); // Log if not interrupted
 	    } else {
 		//Page fault
+		total_page_faults++;
 		log_message("Address %d (page %d) not in memory for P%d. Page Fault.", requested_address, requested_page, requesting_pid);
 		advanceClock(0, 100); //Time for page fault detection
 
@@ -664,7 +706,7 @@ int main(int argc, char *argv[]) {
 		    //==Step 8 update timestamp on Page Load 
 		    frameTable[target_frame].last_ref_seconds = simClock->seconds;
 		    frameTable[target_frame].last_ref_nanos = simClock->nanoseconds;
-		    log_message("LRU/MRU: Frame %d timestamp set to %u:%09u by P%d (Page Load into Free Frame)",
+		    log_message("LRU: Frame %d timestamp set to %u:%09u by P%d (Page Load into Free Frame)",
 				target_frame, simClock->seconds, simClock->nanoseconds, requesting_pid);
 		    
 		    //Update requesting process's  page table
@@ -696,31 +738,28 @@ int main(int argc, char *argv[]) {
 		    log_message("No free frames. Finding Most Recently Used frame for eviction."); //this is for MRU
 		    advanceClock(0, 200); //mru scan
 
-		    int mru_frame_index = -1;
-		    unsigned int mru_s = 0; //Initialize to find the largest time
-		    unsigned int mru_ns = 0;
+		    int lru_frame_index = -1;
+		    unsigned int lru_s = 0xFFFFFFFF; //Initialize to find the largest time
+		    unsigned int lru_ns = 0xFFFFFFFF;
 
 		    for (int i = 0; i < FRAME_TABLE_SIZE; i++) {
 			//All frames are occupied if findFreeFrame() returned -1
 			if (frameTable[i].occupied) {
-			    if (frameTable[i].last_ref_seconds > mru_s) {
-				mru_s = frameTable[i].last_ref_seconds;
-				mru_ns = frameTable[i].last_ref_nanos;
-				mru_frame_index = i;
-			    } else if (frameTable[i].last_ref_seconds == mru_s &&
-					frameTable[i].last_ref_nanos > mru_ns) {
-				mru_ns = frameTable[i].last_ref_nanos;
-				mru_frame_index = i;
+			    if (frameTable[i].last_ref_seconds < lru_s ||
+				(frameTable[i].last_ref_seconds == lru_s && frameTable[i].last_ref_nanos < lru_ns)) {
+				lru_s = frameTable[i].last_ref_seconds;
+				lru_ns = frameTable[i].last_ref_nanos;
+				lru_frame_index = i;
 			    }
 			}
 		    }
 		    
-		    if (mru_frame_index == -1) {
+		    if (lru_frame_index == -1) {
 			//
 			log_message("CRITICAL ERROR: MRU scan failed to find a frame! Defaulting to frame 0.");
-			mru_frame_index = 0; //Fallback, but investigate if this occurs
+			lru_frame_index = 0; //Fallback, but investigate if this occurs
 		    }
-		    int evict_frame = mru_frame_index; //The frame to evict
+		    int evict_frame = lru_frame_index; //The frame to evict
 			//=======STEP 8
 
 		    pid_t evicted_pid = frameTable[evict_frame].process_id;
@@ -777,7 +816,7 @@ int main(int argc, char *argv[]) {
 		    //==Step 8 update timestamp on Page Load
 		    frameTable[target_frame].last_ref_seconds = simClock->seconds;
 		    frameTable[target_frame].last_ref_nanos = simClock->nanoseconds;
-		    log_message("LRU/MRU: Frame %d timestamp set to %u:%09u by P%d (Page Load into Evicted Frame)",
+		    log_message("LRU: Frame %d timestamp set to %u:%09u by P%d (Page Load into Evicted Frame)",
 				target_frame, simClock->seconds, simClock->nanoseconds, requesting_pid);
 
 
@@ -818,13 +857,13 @@ int main(int argc, char *argv[]) {
 
 
 	}
-	//Check errno
-	if (errno != ENOMSG && errno != EINTR) {
-	    log_message("Error: msgrcv failed in main loop: %s", strerror(errno));
-	    terminate_flag = 1;
+	//Periodic memory layout output every simulated second
+	if (simClock->seconds != last_layout_print_sec) {
+	    print_memory_layout();
+	    last_layout_print_sec = simClock->seconds;
 	}
-    }
 
+    }
 
     log_message("Simulation loop finished. Cleaning up...");
     //Cleanup
@@ -933,6 +972,20 @@ static void cleanup(int exit_status) {
 	fclose(log_fp);
 	log_fp = NULL;
     }
+
+
+    //Print statistics before cleanup
+    double sim_seconds = simClock->seconds + simClock->nanoseconds / 1e9;
+    double accesses_per_sec = sim_seconds > 0 ? total_memory_accesses / sim_seconds : 0;
+    double faults_per_access = total_memory_accesses > 0 ? (double)total_page_faults / total_memory_accesses : 0;
+
+    log_message("========== Simulation Statistics ==========");
+    log_message("Total memory accesses: %lu", total_memory_accesses);
+    log_message("Total page faults: %lu", total_page_faults);
+    log_message("Simulated time: %.6f seconds", sim_seconds);
+    log_message("Memory accesses per simulated second: %.3f", accesses_per_sec);
+    log_message("Page faults per memory access: %.3f", faults_per_access);
+    log_message("===========================================");
 
     printf("OSS: Cleanup finished. Exiting with status %d.\n", exit_status);
     exit(exit_status);
