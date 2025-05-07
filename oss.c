@@ -145,13 +145,25 @@ static void log_message(const char* format, ...) {
 static void initializePcbTable() {
     for (int i = 0; i < HARD_PROC_LIMIT; i++) {
 	pcbTable[i].occupied = false;
+
 	pcbTable[i].pid = 0;
 	pcbTable[i].start_seconds = 0;
 	pcbTable[i].start_nanos = 0;
+
 	//Step 5 PCB Table
 	for (int j = 0; j < PROCESS_PAGE_TABLE_SIZE; j++) {
 	    pcbTable[i].page_table[j] = PAGE_NOT_IN_MEMORY; //-1
 	}
+
+	//Step 6: Initialize new PCB fields
+	pcbTable[i].state = PROC_READY; //Start as ready
+	pcbTable[i].io_completion_seconds = 0;
+	pcbTable[i].io_completion_nanos = 0;
+	pcbTable[i].blocked_on_address = -1;
+	pcbTable[i].blocked_request_type = -1;
+	pcbTable[i].blocked_page_number = -1;
+	pcbTable[i].blocked_target_frame = -1;
+
     }
 }
 
@@ -442,7 +454,7 @@ int main(int argc, char *argv[]) {
 	//Step 6 deadlock avoidance for I/O
 	if (active_children_count > 0) {
 	    bool all_blocked = true;
-	    int unblocked_count = 0;
+	   // int unblocked_count = 0;
 	    for (int i = 0; i < HARD_PROC_LIMIT; i++) {
 		if (pcbTable[i].occupied && pcbTable[i].state != PROC_BLOCKED_IO) {
 		    all_blocked = false;
@@ -508,9 +520,12 @@ int main(int argc, char *argv[]) {
 		} else {
 		    //Parent process: Update PCB and counters
 		    pcbTable[pcbIndex].pid = tempPid;
-		    pcbTable[pcbIndex].occupied = 1;
+		    pcbTable[pcbIndex].occupied = true;
 		    pcbTable[pcbIndex].start_seconds = simClock->seconds;
 		    pcbTable[pcbIndex].start_nanos = simClock->nanoseconds;
+		    //Step 6 set state for new process
+		    pcbTable[pcbIndex].state = PROC_READY;
+
 		    active_children_count++;
 		    total_children_launched++;
 		    log_message("Launched child P%d (PID %d) into PCB %d. Total launched: %d, Active: %d",
@@ -625,7 +640,7 @@ int main(int argc, char *argv[]) {
 		    //Free frame found
 		    log_message("Allocating free frame %d for P%d page %d", target_frame, requesting_pid, requested_page);
 
-		    advanceClock(0, 14000000); //add 14ms page fault
+		    //advanceClock(0, 14000000); //add 14ms page fault
 
 
 		    //Step 6 Block process for I/O
@@ -649,7 +664,7 @@ int main(int argc, char *argv[]) {
 		    advance_time_by_nanos(&pcbTable[pcbIndex].io_completion_seconds, &pcbTable[pcbIndex].io_completion_nanos, 14000000);
 
 		    //Store details of the request here
-		    pcbTalbe[pcbIndex].blocked_on_address = requested_address;
+		    pcbTable[pcbIndex].blocked_on_address = requested_address;
 		    pcbTable[pcbIndex].blocked_request_type = request_type;
 		    pcbTable[pcbIndex].blocked_page_number = requested_page;
 		    pcbTable[pcbIndex].blocked_target_frame = target_frame;
@@ -669,6 +684,8 @@ int main(int argc, char *argv[]) {
 		    int evict_frame = 0; //Simplest policy: always evic frame 0
 		    pid_t evicted_pid = frameTable[evict_frame].process_id;
 		    int evicted_page = frameTable[evict_frame].page_number;
+		    //Store dirty bit of the frame 
+		    int evicted_frame_was_dirty = frameTable[evict_frame].dirty_bit;
 
 		    log_message("Evicting P%d page %d from frame %d", evicted_pid, evicted_page, evict_frame);
 
@@ -691,11 +708,18 @@ int main(int argc, char *argv[]) {
                          log_message("Warning: Invalid evicted process (%d) or page (%d) in frame %d.", evicted_pid, evicted_page, evict_frame);
                     }
 
+		    //Check dirty bit of EVICTED frame
+		    long long io_duration_ns = 14000000; //Base time for reading the new page
+		    if (evicted_frame_was_dirty) {
+			log_message("Evicted frame %d (P%d page %d) was dirty. Adding 14ms for write-back.",
+				    evict_frame, evicted_pid, evicted_page);
+			io_duration_ns += 14000000; //add 14ms for writing dirty page
+		    }
+
 		    //Now allocate freed frame
 		    target_frame = evict_frame;
 		    log_message("Allocating evicted frame %d for P%d page %d", target_frame, requesting_pid, requested_page);
 
-		    advanceClock(0, 14000000);
 
 		    //Update frame table entry
 		    frameTable[target_frame].occupied = true;
@@ -706,19 +730,29 @@ int main(int argc, char *argv[]) {
 		    //Update requesting process's page table
 		    pcbTable[pcbIndex].page_table[requested_page] = target_frame;
 
-		    log_message("Page %d for P%d loaded into frame %d after eviction", requested_page, requesting_pid, target_frame);
-		}
+		    //log_message("Page %d for P%d loaded into frame %d after eviction", requested_page, requesting_pid, target_frame);
 
-		//OSS grant message sending
-		OssMsg grant_message;
-                grant_message.mtype = requesting_pid;
-                grant_message.payload = 1; // Simple grant
-                while (msgsnd(msqid, &grant_message, sizeof(OssMsg) - sizeof(long), 0) == -1) {
-                     if (errno == EINTR) continue;
-                     log_message("Error msgsnd grant (fault) to P%d: %s", requesting_pid, strerror(errno));
-                     break; // Exit loop on error
-                }
-                 if (errno != EINTR) log_message("Granted P%d request for address %d after page fault", requesting_pid, requested_address);
+		    //Step 6 start blocking logic for eviction case
+		    log_message("P%d (page %d) requires I/O after eviction. Blocking process.", requesting_pid, requested_page);
+
+		    pcbTable[pcbIndex].state = PROC_BLOCKED_IO;
+                    pcbTable[pcbIndex].io_completion_seconds = simClock->seconds;
+                    pcbTable[pcbIndex].io_completion_nanos = simClock->nanoseconds;
+
+                    // Determine total I/O time: 14ms for read + potentially 14ms for write-back of dirty page (Step 7)
+                    //long long io_duration_ns = 14000000; // Base time for reading the new page
+
+		    advance_time_by_nanos(&pcbTable[pcbIndex].io_completion_seconds, &pcbTable[pcbIndex].io_completion_nanos, io_duration_ns);
+		
+		    pcbTable[pcbIndex].blocked_on_address = requested_address;
+                    pcbTable[pcbIndex].blocked_request_type = request_type;
+                    pcbTable[pcbIndex].blocked_page_number = requested_page;
+                    pcbTable[pcbIndex].blocked_target_frame = target_frame;
+
+		    log_message("P%d (page %d) blocked for I/O to frame %d after eviction. Will complete at %u:%09u.",
+				requesting_pid, requested_page, target_frame,
+				pcbTable[pcbIndex].io_completion_seconds, pcbTable[pcbIndex].io_completion_nanos);
+		}
 
             } // End Page Fault Handling
 
