@@ -28,7 +28,7 @@
 #define DEFAULT_MAX_CONCURRENT 5 //Default for -s
 #define DEFAULT_LAUNCH_INTERVAL_MS 500 //Default for -i (ms)
 //Step 5 define
-#define FRAME_TABLE_SIZE 256
+#define FRAME_TABLE_SIZE 256 //meant 256 but changed to 10 to test the MRU eviction real quick
 #define PROCESS_PAGE_TABLE_SIZE 32
 #define PAGE_NOT_IN_MEMORY -1 
 
@@ -610,6 +610,13 @@ int main(int argc, char *argv[]) {
 		log_message("Address %d (page %d) found in frame %d", requested_address, requested_page, frame_num);
 		advanceClock(0, 100); //add time for memory access
 
+		//Step 8==update timestamp on Page Hit
+		frameTable[frame_num].last_ref_seconds = simClock->seconds;
+		frameTable[frame_num].last_ref_nanos = simClock->nanoseconds;
+		log_message("LRU/MRU: Frame %d timestamp updated to %u:%09u by P%d (Page Hit)",
+			    frame_num, simClock->seconds, simClock->nanoseconds, requesting_pid);
+
+
 		//
 		if (request_type == 1) {
 		    //set dirty bit for step 7 later
@@ -640,11 +647,9 @@ int main(int argc, char *argv[]) {
 		    //Free frame found
 		    log_message("Allocating free frame %d for P%d page %d", target_frame, requesting_pid, requested_page);
 
-		    //advanceClock(0, 14000000); //add 14ms page fault
-
 
 		    //Step 6 Block process for I/O
-		    log_message("P%d (page %d) requires I/O. Blocking process.", requesting_pid, requested_page);
+		    //log_message("P%d (page %d) requires I/O. Blocking process.", requesting_pid, requested_page);
 
 		    //Update frame table entry
 		    frameTable[target_frame].occupied = true;
@@ -654,8 +659,19 @@ int main(int argc, char *argv[]) {
 		    //For step 8 later, update LRU timestamp
 
 		    //Update requesting proess's page table
+		    //pcbTable[pcbIndex].page_table[requested_page] = target_frame;
+
+		    //==Step 8 update timestamp on Page Load 
+		    frameTable[target_frame].last_ref_seconds = simClock->seconds;
+		    frameTable[target_frame].last_ref_nanos = simClock->nanoseconds;
+		    log_message("LRU/MRU: Frame %d timestamp set to %u:%09u by P%d (Page Load into Free Frame)",
+				target_frame, simClock->seconds, simClock->nanoseconds, requesting_pid);
+		    
+		    //Update requesting process's  page table
 		    pcbTable[pcbIndex].page_table[requested_page] = target_frame;
 
+		    //Step 6 BLock process for I/O
+		    log_message("P%d (page %d) requires I/O. Blocking process.", requesting_pid, requested_page);
 		    //switch the process to blocked state and record I/O
 		    pcbTable[pcbIndex].state = PROC_BLOCKED_IO;
 		    pcbTable[pcbIndex].io_completion_seconds = simClock->seconds;
@@ -673,21 +689,48 @@ int main(int argc, char *argv[]) {
                 		requesting_pid, requested_page, target_frame,
                 		pcbTable[pcbIndex].io_completion_seconds, pcbTable[pcbIndex].io_completion_nanos);
 
-		    //============Step6
+		    //============Step 6
 
-		    log_message("Page %d for P%d loaded into frame %d", requested_page, requesting_pid, target_frame);
 		} else {
 		    //No free frames step 5 simple eviction
-		    log_message("No free frames. Evicting frame 0 (simple policy).");
-		    advanceClock(0, 500);
+		    log_message("No free frames. Finding Most Recently Used frame for eviction."); //this is for MRU
+		    advanceClock(0, 200); //mru scan
 
-		    int evict_frame = 0; //Simplest policy: always evic frame 0
+		    int mru_frame_index = -1;
+		    unsigned int mru_s = 0; //Initialize to find the largest time
+		    unsigned int mru_ns = 0;
+
+		    for (int i = 0; i < FRAME_TABLE_SIZE; i++) {
+			//All frames are occupied if findFreeFrame() returned -1
+			if (frameTable[i].occupied) {
+			    if (frameTable[i].last_ref_seconds > mru_s) {
+				mru_s = frameTable[i].last_ref_seconds;
+				mru_ns = frameTable[i].last_ref_nanos;
+				mru_frame_index = i;
+			    } else if (frameTable[i].last_ref_seconds == mru_s &&
+					frameTable[i].last_ref_nanos > mru_ns) {
+				mru_ns = frameTable[i].last_ref_nanos;
+				mru_frame_index = i;
+			    }
+			}
+		    }
+		    
+		    if (mru_frame_index == -1) {
+			//
+			log_message("CRITICAL ERROR: MRU scan failed to find a frame! Defaulting to frame 0.");
+			mru_frame_index = 0; //Fallback, but investigate if this occurs
+		    }
+		    int evict_frame = mru_frame_index; //The frame to evict
+			//=======STEP 8
+
 		    pid_t evicted_pid = frameTable[evict_frame].process_id;
 		    int evicted_page = frameTable[evict_frame].page_number;
-		    //Store dirty bit of the frame 
-		    int evicted_frame_was_dirty = frameTable[evict_frame].dirty_bit;
+		    int evicted_frame_was_dirty = frameTable[evict_frame].dirty_bit; //STore dirty bit of the frame
 
-		    log_message("Evicting P%d page %d from frame %d", evicted_pid, evicted_page, evict_frame);
+		    log_message("MRU Eviction: Selected frame %d (P%d pg %d, Time %u:%09u) for eviction.",
+                                evict_frame, evicted_pid, evicted_page,
+                                frameTable[evict_frame].last_ref_seconds, frameTable[evict_frame].last_ref_nanos);
+
 
 		    //Update evicted process's page table
 		    if (evicted_pid > 0 && evicted_page >= 0 && evicted_page < PROCESS_PAGE_TABLE_SIZE) {
@@ -700,13 +743,14 @@ int main(int argc, char *argv[]) {
 			}
 			if (evicted_pcb_index != -1) {
 			    pcbTable[evicted_pcb_index].page_table[evicted_page] = PAGE_NOT_IN_MEMORY;
-                           log_message("Updated P%d's page table (page %d set to -1)", evicted_pid, evicted_page);
+			    log_message("Updated P%d's page table (page %d set to -1)", evicted_pid, evicted_page);
                         } else {
                             log_message("Warning: Couldn't find PCB for evicted process P%d to update page table.", evicted_pid);
                         }
                     } else {
                          log_message("Warning: Invalid evicted process (%d) or page (%d) in frame %d.", evicted_pid, evicted_page, evict_frame);
                     }
+
 
 		    //Check dirty bit of EVICTED frame
 		    long long io_duration_ns = 14000000; //Base time for reading the new page
@@ -728,31 +772,47 @@ int main(int argc, char *argv[]) {
                     frameTable[target_frame].dirty_bit = (request_type == 1) ? 1 : 0;
 
 		    //Update requesting process's page table
-		    pcbTable[pcbIndex].page_table[requested_page] = target_frame;
+		    //pcbTable[pcbIndex].page_table[requested_page] = target_frame;
 
-		    //log_message("Page %d for P%d loaded into frame %d after eviction", requested_page, requesting_pid, target_frame);
+		    //==Step 8 update timestamp on Page Load
+		    frameTable[target_frame].last_ref_seconds = simClock->seconds;
+		    frameTable[target_frame].last_ref_nanos = simClock->nanoseconds;
+		    log_message("LRU/MRU: Frame %d timestamp set to %u:%09u by P%d (Page Load into Evicted Frame)",
+				target_frame, simClock->seconds, simClock->nanoseconds, requesting_pid);
+
 
 		    //Step 6 start blocking logic for eviction case
-		    log_message("P%d (page %d) requires I/O after eviction. Blocking process.", requesting_pid, requested_page);
+		    //log_message("P%d (page %d) requires I/O after eviction. Blocking process.", requesting_pid, requested_page);
 
-		    pcbTable[pcbIndex].state = PROC_BLOCKED_IO;
-                    pcbTable[pcbIndex].io_completion_seconds = simClock->seconds;
-                    pcbTable[pcbIndex].io_completion_nanos = simClock->nanoseconds;
+		    //pcbTable[pcbIndex].state = PROC_BLOCKED_IO;
+                    //pcbTable[pcbIndex].io_completion_seconds = simClock->seconds;
+                    //pcbTable[pcbIndex].io_completion_nanos = simClock->nanoseconds;
 
                     // Determine total I/O time: 14ms for read + potentially 14ms for write-back of dirty page (Step 7)
                     //long long io_duration_ns = 14000000; // Base time for reading the new page
 
-		    advance_time_by_nanos(&pcbTable[pcbIndex].io_completion_seconds, &pcbTable[pcbIndex].io_completion_nanos, io_duration_ns);
+		    //advance_time_by_nanos(&pcbTable[pcbIndex].io_completion_seconds, &pcbTable[pcbIndex].io_completion_nanos, io_duration_ns);
 		
+	
+                    pcbTable[pcbIndex].blocked_target_frame = target_frame;
+
+		    //Step 6 Block process for I/O
+		    log_message("P%d (page %d) requires I/O after eviction. Will complete at %u:%09u.",
+				requesting_pid, requested_page, target_frame,
+				pcbTable[pcbIndex].io_completion_seconds, pcbTable[pcbIndex].io_completion_nanos);
+
+		    pcbTable[pcbIndex].state = PROC_BLOCKED_IO;
+                    pcbTable[pcbIndex].io_completion_seconds = simClock->seconds;
+                    pcbTable[pcbIndex].io_completion_nanos = simClock->nanoseconds;
+                    advance_time_by_nanos(&pcbTable[pcbIndex].io_completion_seconds, &pcbTable[pcbIndex].io_completion_nanos, io_duration_ns);
+		    
 		    pcbTable[pcbIndex].blocked_on_address = requested_address;
                     pcbTable[pcbIndex].blocked_request_type = request_type;
                     pcbTable[pcbIndex].blocked_page_number = requested_page;
-                    pcbTable[pcbIndex].blocked_target_frame = target_frame;
-
 		    log_message("P%d (page %d) blocked for I/O to frame %d after eviction. Will complete at %u:%09u.",
 				requesting_pid, requested_page, target_frame,
 				pcbTable[pcbIndex].io_completion_seconds, pcbTable[pcbIndex].io_completion_nanos);
-		}
+		} //ENd of no free frame eviction case
 
             } // End Page Fault Handling
 
